@@ -312,7 +312,7 @@ export default function Page() {
             <div>
               {/* display individual operations */}
               {Array.from(operationsMap).map(([key, value]) => (
-                <div key={key} className="p-1 border border-gray-400 border-1 rounded mx-auto mb-2 w-11/12">
+                <div key={key} className="p-1 border border-gray-400 border-1 rounded-sm mx-auto mb-2 w-11/12">
                   <div className="flex justify-between p-1 pl-0">
                     <div className="text-gray-400 text-xs">{value.insert && value.del ? "replaced" : value.insert ? "inserted" : "deleted"}</div>
                     {plusMinusDisplayText(value)}
