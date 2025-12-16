@@ -3,7 +3,6 @@
 import type {
 	DocumentComparison,
 	Geometry,
-	Immutable_2 as Immutable,
 	Instance,
 } from "@nutrient-sdk/viewer";
 import { useEffect, useRef, useState } from "react";
@@ -16,6 +15,9 @@ interface ChangeOperation {
 	del?: boolean;
 	insert?: boolean;
 	pageIndex?: number; // Track which page this change is on
+	originalRect?: Geometry.Rect; // Rectangle for deleted text in original document
+	changedRect?: Geometry.Rect; // Rectangle for inserted text in changed document
+	annotationIds?: string[]; // Store annotation IDs for this change
 }
 
 export default function Page() {
@@ -28,15 +30,47 @@ export default function Page() {
 	const [operationsMap, setOperationsMap] = useState<
 		Map<string, ChangeOperation>
 	>(new Map()); // UI state for rendering changes in the sidebar
+	const [selectedChangeIndex, setSelectedChangeIndex] = useState<number>(0); // Track currently selected change
+	const [isScrollLocked, setIsScrollLocked] = useState<boolean>(true); // Track whether scrolling is synchronized
+	const isScrollLockedRef = useRef<boolean>(true); // Ref to track scroll lock state for event handlers
+	const isSyncingRef = useRef<boolean>(false); // Ref to prevent sync loop
+	const lastSyncTimeRef = useRef<number>(0); // Ref to track last sync time for throttling
 	const originalContainerRef = useRef<HTMLDivElement>(null); // Ref for the original document viewer container
 	const changedContainerRef = useRef<HTMLDivElement>(null); // Ref for the changed document viewer container
 	const operationsRef = useRef<Map<string, ChangeOperation>>(new Map()); // Ref for tracking changes across all pages
 	const originalInstanceRef = useRef<Instance | null>(null); // Ref for the original viewer instance
 	const changedInstanceRef = useRef<Instance | null>(null); // Ref for the changed viewer instance
+	const selectionAnnotationIdsRef = useRef<string[]>([]); // Track selection border annotation IDs
+	const annotationToChangeIndexRef = useRef<Map<string, number>>(new Map()); // Map annotation IDs to change indices
 
 	// Trigger re-render by updating state
 	function updateOperationsMap(existingMap: Map<string, ChangeOperation>) {
 		setOperationsMap(new Map(existingMap));
+	}
+
+	// Toggle scroll lock and update both state and ref
+	function toggleScrollLock() {
+		const newValue = !isScrollLocked;
+		setIsScrollLocked(newValue);
+		isScrollLockedRef.current = newValue;
+	}
+
+	// Handle clicking on annotations in the document
+	function handleAnnotationClick(event: { annotation: { id: string } }) {
+		const annotationId = event.annotation.id;
+		const changeIndex = annotationToChangeIndexRef.current.get(annotationId);
+
+		if (
+			changeIndex !== undefined &&
+			operationsRef.current &&
+			operationsRef.current.size > 0
+		) {
+			const changesArray = Array.from(operationsRef.current);
+			if (changeIndex < changesArray.length) {
+				const [, operation] = changesArray[changeIndex];
+				handleChangeClick(operation, changeIndex);
+			}
+		}
 	}
 
 	/**
@@ -124,6 +158,18 @@ export default function Page() {
 			const originalContainer = originalContainerRef.current;
 			const changedContainer = changedContainerRef.current;
 
+			const toolbarItems = [
+				{ type: "sidebar-thumbnails" },
+				{ type: "sidebar-document-outline" },
+				{ type: "sidebar-bookmarks" },
+				{ type: "pager" },
+				{ type: "pan" },
+				{ type: "zoom-out" },
+				{ type: "zoom-in" },
+				{ type: "zoom-mode" },
+				{ type: "linearized-download-indicator" },
+			];
+
 			originalContainer
 				? window.NutrientViewer.unload(originalContainer)
 				: null;
@@ -135,6 +181,7 @@ export default function Page() {
 				useCDN: true,
 				styleSheets: ["/styles.css"],
 				licenseKey: licenseKey,
+				toolbarItems: toolbarItems,
 			});
 
 			const changedInstance: Instance = await window.NutrientViewer.load({
@@ -143,54 +190,160 @@ export default function Page() {
 				useCDN: true,
 				styleSheets: ["/styles.css"],
 				licenseKey: licenseKey,
+				toolbarItems: toolbarItems,
 			});
 
 			// Store instances in refs for access from click handlers
 			originalInstanceRef.current = originalInstance;
 			changedInstanceRef.current = changedInstance;
 
-			// add event listeners to sync the view state to the right viewer
-			const scrollElement =
+			// Add click listeners to annotations in both documents
+			originalInstance.addEventListener(
+				"annotations.press",
+				handleAnnotationClick,
+			);
+			changedInstance.addEventListener(
+				"annotations.press",
+				handleAnnotationClick,
+			);
+
+			// Synchronize changed viewer -> original viewer
+			const changedScrollElement =
 				changedInstance.contentDocument.querySelector(".PSPDFKit-Scroll");
-			scrollElement?.addEventListener("scroll", syncViewState);
+			changedScrollElement?.addEventListener("scroll", syncChangedToOriginal, {
+				passive: true,
+			});
 			changedInstance.addEventListener(
 				"viewState.currentPageIndex.change",
-				syncViewState,
+				syncChangedToOriginal,
 			);
-			changedInstance.addEventListener("viewState.zoom.change", syncViewState);
+			changedInstance.addEventListener(
+				"viewState.zoom.change",
+				syncChangedToOriginal,
+			);
 
-			// synchronize the view state of the original instance viewer to the changed instance viewer
-			function syncViewState() {
-				// Get the current view state from the left viewer
-				const changedScrollElement =
-					changedInstance.contentDocument.querySelector(
-						".PSPDFKit-Scroll",
-					) as HTMLElement | null;
+			// Synchronize original viewer -> changed viewer
+			const originalScrollElement =
+				originalInstance.contentDocument.querySelector(".PSPDFKit-Scroll");
+			originalScrollElement?.addEventListener("scroll", syncOriginalToChanged, {
+				passive: true,
+			});
+			originalInstance.addEventListener(
+				"viewState.currentPageIndex.change",
+				syncOriginalToChanged,
+			);
+			originalInstance.addEventListener(
+				"viewState.zoom.change",
+				syncOriginalToChanged,
+			);
 
-				const customViewState = {
-					pageNumber: changedInstance.viewState.currentPageIndex,
-					zoomLevel: changedInstance.viewState.zoom,
-					scrollLeft: changedScrollElement?.scrollLeft || 0,
-					scrollTop: changedScrollElement?.scrollTop || 0,
-				};
+			// Sync from changed (right) to original (left)
+			function syncChangedToOriginal() {
+				// Only sync if scroll is locked and not already syncing
+				if (!isScrollLockedRef.current || isSyncingRef.current) return;
 
-				// Set the page number and zoom level for the right viewer
-				const viewState = originalInstance.viewState;
-				originalInstance.setViewState(
-					viewState.set("currentPageIndex", customViewState.pageNumber),
-				);
-				originalInstance.setViewState(
-					viewState.set("zoom", customViewState.zoomLevel),
-				);
+				// Throttle: only sync every 16ms (roughly 60fps)
+				const now = performance.now();
+				if (now - lastSyncTimeRef.current < 16) return;
+				lastSyncTimeRef.current = now;
 
-				// Set scroll position for the right viewer
-				const originalScrollElement =
-					originalInstance.contentDocument.querySelector(
-						".PSPDFKit-Scroll",
-					) as HTMLElement | null;
-				if (originalScrollElement) {
-					originalScrollElement.scrollLeft = customViewState.scrollLeft;
-					originalScrollElement.scrollTop = customViewState.scrollTop;
+				isSyncingRef.current = true;
+
+				try {
+					// Get the current view state from the changed viewer
+					const changedScrollElement =
+						changedInstance.contentDocument.querySelector(
+							".PSPDFKit-Scroll",
+						) as HTMLElement | null;
+
+					const customViewState = {
+						pageNumber: changedInstance.viewState.currentPageIndex,
+						zoomLevel: changedInstance.viewState.zoom,
+						scrollLeft: changedScrollElement?.scrollLeft || 0,
+						scrollTop: changedScrollElement?.scrollTop || 0,
+					};
+
+					const originalPageIndex = originalInstance.viewState.currentPageIndex;
+
+					// Always sync zoom level
+					const viewState = originalInstance.viewState;
+					originalInstance.setViewState(
+						viewState.set("zoom", customViewState.zoomLevel),
+					);
+
+					// If pages differ, only update page number (let SDK handle layout)
+					if (originalPageIndex !== customViewState.pageNumber) {
+						originalInstance.setViewState(
+							viewState.set("currentPageIndex", customViewState.pageNumber),
+						);
+					} else {
+						// Same page: sync scroll positions directly for smooth scrolling
+						const originalScrollElement =
+							originalInstance.contentDocument.querySelector(
+								".PSPDFKit-Scroll",
+							) as HTMLElement | null;
+						if (originalScrollElement) {
+							originalScrollElement.scrollLeft = customViewState.scrollLeft;
+							originalScrollElement.scrollTop = customViewState.scrollTop;
+						}
+					}
+				} finally {
+					isSyncingRef.current = false;
+				}
+			}
+
+			// Sync from original (left) to changed (right)
+			function syncOriginalToChanged() {
+				// Only sync if scroll is locked and not already syncing
+				if (!isScrollLockedRef.current || isSyncingRef.current) return;
+
+				// Throttle: only sync every 16ms (roughly 60fps)
+				const now = performance.now();
+				if (now - lastSyncTimeRef.current < 16) return;
+				lastSyncTimeRef.current = now;
+
+				isSyncingRef.current = true;
+
+				try {
+					// Get the current view state from the original viewer
+					const originalScrollElement =
+						originalInstance.contentDocument.querySelector(
+							".PSPDFKit-Scroll",
+						) as HTMLElement | null;
+
+					const customViewState = {
+						pageNumber: originalInstance.viewState.currentPageIndex,
+						zoomLevel: originalInstance.viewState.zoom,
+						scrollLeft: originalScrollElement?.scrollLeft || 0,
+						scrollTop: originalScrollElement?.scrollTop || 0,
+					};
+
+					const changedPageIndex = changedInstance.viewState.currentPageIndex;
+
+					// Always sync zoom level
+					const viewState = changedInstance.viewState;
+					changedInstance.setViewState(
+						viewState.set("zoom", customViewState.zoomLevel),
+					);
+
+					// If pages differ, only update page number (let SDK handle layout)
+					if (changedPageIndex !== customViewState.pageNumber) {
+						changedInstance.setViewState(
+							viewState.set("currentPageIndex", customViewState.pageNumber),
+						);
+					} else {
+						// Same page: sync scroll positions directly for smooth scrolling
+						const changedScrollElement =
+							changedInstance.contentDocument.querySelector(
+								".PSPDFKit-Scroll",
+							) as HTMLElement | null;
+						if (changedScrollElement) {
+							changedScrollElement.scrollLeft = customViewState.scrollLeft;
+							changedScrollElement.scrollTop = customViewState.scrollTop;
+						}
+					}
+				} finally {
+					isSyncingRef.current = false;
 				}
 			}
 
@@ -210,9 +363,6 @@ export default function Page() {
 					pageIndexes: [pageIndex],
 				});
 
-				// Variables for storing temporary annotation data for each page
-				let originalInstanceRects = window.NutrientViewer.Immutable.List([]);
-				let changedInstanceRects = window.NutrientViewer.Immutable.List([]);
 				// Map to store changes for each page
 				const changes = new Map<string, ChangeOperation>();
 
@@ -230,98 +380,108 @@ export default function Page() {
 				);
 
 				// Process comparison results
-				function processOperation(operation: Operation) {
-					const rect = operation.changedTextBlocks[0].rect;
-					const coordinate = `${rect[0]},${rect[1]}`;
-
+				async function processOperation(operation: Operation) {
 					switch (operation.type) {
-						case "delete":
-							originalInstanceRects = originalInstanceRects.push(
-								// Annotations for the original document
-								new window.NutrientViewer.Geometry.Rect({
-									left: operation.originalTextBlocks[0].rect[0],
-									top: operation.originalTextBlocks[0].rect[1],
-									width: operation.originalTextBlocks[0].rect[2],
-									height: operation.originalTextBlocks[0].rect[3],
-								}),
-							);
+						case "delete": {
+							// Use original text blocks for delete operations
+							const rect = operation.originalTextBlocks[0].rect;
+							const coordinate = `${rect[0]},${rect[1]}`;
+
+							const originalRect = new window.NutrientViewer.Geometry.Rect({
+								left: operation.originalTextBlocks[0].rect[0],
+								top: operation.originalTextBlocks[0].rect[1],
+								width: operation.originalTextBlocks[0].rect[2],
+								height: operation.originalTextBlocks[0].rect[3],
+							});
+
+							// Create annotation and get its ID
+							const annotation =
+								new window.NutrientViewer.Annotations.HighlightAnnotation({
+									pageIndex,
+									rects: window.NutrientViewer.Immutable.List([originalRect]),
+									color: new window.NutrientViewer.Color(deleteHighlightColor),
+								});
+							const created = await originalInstance.create(annotation);
+							const annotationId =
+								created.length > 0 ? (created[0] as any).id : null;
 
 							// Sidebar changes Map
 							// If the coordinate already exists, add the deleteText value in the existing object
 							if (changes.has(coordinate)) {
+								const existing = changes.get(coordinate)!;
 								changes.set(coordinate, {
-									...changes.get(coordinate),
+									...existing,
 									deleteText: operation.text,
 									del: true,
 									pageIndex,
+									originalRect,
+									annotationIds: [
+										...(existing.annotationIds || []),
+										...(annotationId ? [annotationId] : []),
+									],
 								});
 							} else {
 								changes.set(coordinate, {
 									deleteText: operation.text,
 									del: true,
 									pageIndex,
+									originalRect,
+									annotationIds: annotationId ? [annotationId] : [],
 								});
 							}
 							break;
+						}
 
-						case "insert":
-							changedInstanceRects = changedInstanceRects.push(
-								// Annotations for the changed document
-								new window.NutrientViewer.Geometry.Rect({
-									left: rect[0],
-									top: rect[1],
-									width: rect[2],
-									height: rect[3],
-								}),
-							);
+						case "insert": {
+							// Use changed text blocks for insert operations
+							const rect = operation.changedTextBlocks[0].rect;
+							const coordinate = `${rect[0]},${rect[1]}`;
+
+							const changedRect = new window.NutrientViewer.Geometry.Rect({
+								left: rect[0],
+								top: rect[1],
+								width: rect[2],
+								height: rect[3],
+							});
+
+							// Create annotation and get its ID
+							const annotation =
+								new window.NutrientViewer.Annotations.HighlightAnnotation({
+									pageIndex,
+									rects: window.NutrientViewer.Immutable.List([changedRect]),
+									color: new window.NutrientViewer.Color(insertHighlightColor),
+								});
+							const created = await changedInstance.create(annotation);
+							const annotationId =
+								created.length > 0 ? (created[0] as any).id : null;
 
 							// Sidebar changes Map
 							// Update or create insert change entry
 							if (changes.has(coordinate)) {
+								const existing = changes.get(coordinate)!;
 								changes.set(coordinate, {
-									...changes.get(coordinate),
+									...existing,
 									insertText: operation.text,
 									insert: true,
 									pageIndex,
+									changedRect,
+									annotationIds: [
+										...(existing.annotationIds || []),
+										...(annotationId ? [annotationId] : []),
+									],
 								});
 							} else {
 								changes.set(coordinate, {
 									insertText: operation.text,
 									insert: true,
 									pageIndex,
+									changedRect,
+									annotationIds: annotationId ? [annotationId] : [],
 								});
 							}
 							break;
+						}
 					}
-				}
-
-				// Helper function to create and add highlight annotations
-				async function createHighlightAnnotations(
-					pageIndex: number,
-					originalRects: Immutable.List<Geometry.Rect>,
-					changedRects: Immutable.List<Geometry.Rect>,
-					originalInstance: Instance,
-					changedInstance: Instance,
-				) {
-					// Create highlight annotations for the original document
-					const originalAnnotations =
-						new window.NutrientViewer.Annotations.HighlightAnnotation({
-							pageIndex,
-							rects: originalRects,
-							color: new window.NutrientViewer.Color(deleteHighlightColor),
-						});
-
-					// Create highlight annotations for the changed document
-					const changedAnnotations =
-						new window.NutrientViewer.Annotations.HighlightAnnotation({
-							pageIndex,
-							rects: changedRects,
-							color: new window.NutrientViewer.Color(insertHighlightColor),
-						});
-
-					// Add annotations to the documents
-					await originalInstance.create(originalAnnotations);
-					await changedInstance.create(changedAnnotations);
 				}
 
 				// Iterate through comparison results structure
@@ -329,46 +489,136 @@ export default function Page() {
 					comparisonResult &&
 					"documentComparisonResults" in comparisonResult
 				) {
-					comparisonResult.documentComparisonResults.forEach(
-						(docComparison) => {
-							docComparison.comparisonResults.forEach((result) => {
-								result.hunks.forEach((hunk) => {
-									hunk.operations.forEach((operation) => {
-										if (operation.type !== "equal") {
-											processOperation(operation);
-										}
-									});
-								});
-							});
-						},
-					);
+					for (const docComparison of comparisonResult.documentComparisonResults) {
+						for (const result of docComparison.comparisonResults) {
+							for (const hunk of result.hunks) {
+								const operations = hunk.operations.filter(
+									(op: Operation) => op.type !== "equal",
+								);
+
+								// Process operations, looking for consecutive delete+insert pairs
+								let i = 0;
+								while (i < operations.length) {
+									const currentOp = operations[i];
+
+									// Check if this is a delete followed by an insert (replacement)
+									if (
+										currentOp.type === "delete" &&
+										i + 1 < operations.length &&
+										operations[i + 1].type === "insert"
+									) {
+										// Process as a replacement
+										const deleteOp = currentOp;
+										const insertOp = operations[i + 1];
+
+										// Use the delete operation's coordinate as the key
+										const deleteRect = deleteOp.originalTextBlocks[0].rect;
+										const coordinate = `${deleteRect[0]},${deleteRect[1]}`;
+
+										const originalRect =
+											new window.NutrientViewer.Geometry.Rect({
+												left: deleteRect[0],
+												top: deleteRect[1],
+												width: deleteRect[2],
+												height: deleteRect[3],
+											});
+
+										const insertRect = insertOp.changedTextBlocks[0].rect;
+										const changedRect = new window.NutrientViewer.Geometry.Rect(
+											{
+												left: insertRect[0],
+												top: insertRect[1],
+												width: insertRect[2],
+												height: insertRect[3],
+											},
+										);
+
+										// Create delete annotation
+										const deleteAnnotation =
+											new window.NutrientViewer.Annotations.HighlightAnnotation(
+												{
+													pageIndex,
+													rects: window.NutrientViewer.Immutable.List([
+														originalRect,
+													]),
+													color: new window.NutrientViewer.Color(
+														deleteHighlightColor,
+													),
+												},
+											);
+										const createdDelete =
+											await originalInstance.create(deleteAnnotation);
+										const deleteAnnotationId =
+											createdDelete.length > 0
+												? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+													(createdDelete[0] as any).id
+												: null;
+
+										// Create insert annotation
+										const insertAnnotation =
+											new window.NutrientViewer.Annotations.HighlightAnnotation(
+												{
+													pageIndex,
+													rects: window.NutrientViewer.Immutable.List([
+														changedRect,
+													]),
+													color: new window.NutrientViewer.Color(
+														insertHighlightColor,
+													),
+												},
+											);
+										const createdInsert =
+											await changedInstance.create(insertAnnotation);
+										const insertAnnotationId =
+											createdInsert.length > 0
+												? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+													(createdInsert[0] as any).id
+												: null;
+
+										// Store as a replacement
+										changes.set(coordinate, {
+											deleteText: deleteOp.text,
+											insertText: insertOp.text,
+											del: true,
+											insert: true,
+											pageIndex,
+											originalRect,
+											changedRect,
+											annotationIds: [
+												...(deleteAnnotationId ? [deleteAnnotationId] : []),
+												...(insertAnnotationId ? [insertAnnotationId] : []),
+											],
+										});
+
+										// Skip the next operation since we processed it
+										i += 2;
+									} else {
+										// Process as a standalone delete or insert
+										await processOperation(currentOp);
+										i++;
+									}
+								}
+							}
+						}
+					}
 				}
 
-				/*
-        Update the stateful operations Map, merge new changes with existing changes.
-        This is necessary because the comparison is done per page
-        and we need to accumulate changes across all pages to display them in the sidebar.
-        The key is the coordinate of the change.
-        The value is an object with the text that was deleted and inserted
-        and flags to indicate the type of change.
-        e.g. { "0,0": { deleteText: "old text", insertText: "new text", del: true, insert: true } }
-        The flags are used to determine the type of change and render appropriate styling in the sidebar.
-        The sidebar displays the number of words changed and the actual text that was deleted and inserted
-        */
 				operationsRef.current = new Map([...operationsRef.current, ...changes]);
-
-				// Create and add highlight annotations
-				await createHighlightAnnotations(
-					pageIndex,
-					originalInstanceRects,
-					changedInstanceRects,
-					originalInstance,
-					changedInstance,
-				);
 			}
 
 			// Update state to trigger re-render
 			updateOperationsMap(operationsRef.current);
+
+			// Build annotation ID to change index mapping
+			const annotationMap = new Map<string, number>();
+			Array.from(operationsRef.current).forEach(([, operation], index) => {
+				if (operation.annotationIds) {
+					operation.annotationIds.forEach((annotationId) => {
+						annotationMap.set(annotationId, index);
+					});
+				}
+			});
+			annotationToChangeIndexRef.current = annotationMap;
 		}
 	}
 
@@ -409,15 +659,148 @@ export default function Page() {
 		}
 	}
 
+	// Add border annotations around selected change
+	async function highlightSelectedChange(operation: ChangeOperation) {
+		if (!originalInstanceRef.current || !changedInstanceRef.current) return;
+
+		// Remove previous selection annotations
+		for (const annotationId of selectionAnnotationIdsRef.current) {
+			try {
+				await originalInstanceRef.current.delete(annotationId);
+			} catch {
+				// Annotation might be in changed instance
+				try {
+					await changedInstanceRef.current.delete(annotationId);
+				} catch {
+					// Annotation doesn't exist, ignore
+				}
+			}
+		}
+		selectionAnnotationIdsRef.current = [];
+
+		// Create border color (blue to match Nutrient UI)
+		const borderColor = new window.NutrientViewer.Color({
+			r: 59,
+			g: 130,
+			b: 246,
+		});
+
+		// Add border around deleted text in original document
+		if (
+			operation.del &&
+			operation.originalRect &&
+			operation.pageIndex !== undefined
+		) {
+			// Expand the bounding box by a few pixels
+			const expandedRect = new window.NutrientViewer.Geometry.Rect({
+				left: operation.originalRect.left - 3,
+				top: operation.originalRect.top - 3,
+				width: operation.originalRect.width + 6,
+				height: operation.originalRect.height + 6,
+			});
+
+			const borderAnnotation =
+				new window.NutrientViewer.Annotations.RectangleAnnotation({
+					pageIndex: operation.pageIndex,
+					boundingBox: expandedRect,
+					strokeColor: borderColor,
+					strokeWidth: 2,
+					fillColor: null, // No fill
+				});
+
+			const createdAnnotations =
+				await originalInstanceRef.current.create(borderAnnotation);
+			if (createdAnnotations.length > 0) {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				selectionAnnotationIdsRef.current.push(
+					(createdAnnotations[0] as any).id,
+				);
+			}
+		}
+
+		// Add border around inserted text in changed document
+		if (
+			operation.insert &&
+			operation.changedRect &&
+			operation.pageIndex !== undefined
+		) {
+			// Expand the bounding box by a few pixels
+			const expandedRect = new window.NutrientViewer.Geometry.Rect({
+				left: operation.changedRect.left - 3,
+				top: operation.changedRect.top - 3,
+				width: operation.changedRect.width + 6,
+				height: operation.changedRect.height + 6,
+			});
+
+			const borderAnnotation =
+				new window.NutrientViewer.Annotations.RectangleAnnotation({
+					pageIndex: operation.pageIndex,
+					boundingBox: expandedRect,
+					strokeColor: borderColor,
+					strokeWidth: 2,
+					fillColor: null, // No fill
+				});
+
+			const createdAnnotations =
+				await changedInstanceRef.current.create(borderAnnotation);
+			if (createdAnnotations.length > 0) {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				selectionAnnotationIdsRef.current.push(
+					(createdAnnotations[0] as any).id,
+				);
+			}
+		}
+	}
+
 	// Handle clicking on a sidebar item to scroll to that page
-	function handleChangeClick(operation: ChangeOperation) {
+	async function handleChangeClick(operation: ChangeOperation, index: number) {
+		setSelectedChangeIndex(index);
 		if (
 			operation.pageIndex !== undefined &&
 			originalInstanceRef.current &&
 			changedInstanceRef.current
 		) {
-			scrollToPage(originalInstanceRef.current, operation.pageIndex);
-			scrollToPage(changedInstanceRef.current, operation.pageIndex);
+			await scrollToPage(originalInstanceRef.current, operation.pageIndex);
+			await scrollToPage(changedInstanceRef.current, operation.pageIndex);
+			await highlightSelectedChange(operation);
+		}
+	}
+
+	// Navigate to previous change
+	async function handlePreviousChange() {
+		const changesArray = Array.from(operationsMap);
+		if (selectedChangeIndex > 0) {
+			const newIndex = selectedChangeIndex - 1;
+			setSelectedChangeIndex(newIndex);
+			const [, operation] = changesArray[newIndex];
+			if (
+				operation.pageIndex !== undefined &&
+				originalInstanceRef.current &&
+				changedInstanceRef.current
+			) {
+				await scrollToPage(originalInstanceRef.current, operation.pageIndex);
+				await scrollToPage(changedInstanceRef.current, operation.pageIndex);
+				await highlightSelectedChange(operation);
+			}
+		}
+	}
+
+	// Navigate to next change
+	async function handleNextChange() {
+		const changesArray = Array.from(operationsMap);
+		if (selectedChangeIndex < changesArray.length - 1) {
+			const newIndex = selectedChangeIndex + 1;
+			setSelectedChangeIndex(newIndex);
+			const [, operation] = changesArray[newIndex];
+			if (
+				operation.pageIndex !== undefined &&
+				originalInstanceRef.current &&
+				changedInstanceRef.current
+			) {
+				await scrollToPage(originalInstanceRef.current, operation.pageIndex);
+				await scrollToPage(changedInstanceRef.current, operation.pageIndex);
+				await highlightSelectedChange(operation);
+			}
 		}
 	}
 
@@ -453,40 +836,117 @@ export default function Page() {
 				{/* changes sidebar */}
 				<div className="col-span-2">
 					<div className="sm:block border">
-						<p className="p-3">Changes</p>
-						<div>
-							{/* display individual operations */}
-							{Array.from(operationsMap).map(([key, value]) => (
+						<div className="flex justify-between items-center p-3 border-b">
+							<p>
+								{operationsMap.size} Change{operationsMap.size !== 1 ? "s" : ""}
+							</p>
+							<div className="flex gap-1">
 								<button
-									key={key}
 									type="button"
-									className="p-1 border border-gray-400 rounded-sm mx-auto mb-2 w-11/12 cursor-pointer hover:bg-gray-100 transition-colors text-left block"
-									onClick={() => handleChangeClick(value)}
+									onClick={toggleScrollLock}
+									className="p-1 px-2 border border-gray-400 rounded hover:bg-gray-100 transition-colors"
+									title={
+										isScrollLocked ? "Unlock scroll sync" : "Lock scroll sync"
+									}
 								>
-									<div className="flex justify-between p-1 pl-0">
-										<div className="text-gray-400 text-xs">
-											{value.insert && value.del
-												? "replaced"
-												: value.insert
-													? "inserted"
-													: "deleted"}
-										</div>
-										{plusMinusDisplayText(value)}
-									</div>
-									<div>
-										<p className="text-xs">
-											<span className="bg-delete-highlight">
-												{value.deleteText}
-											</span>
-										</p>
-										<p className="text-xs">
-											<span className="bg-insert-highlight">
-												{value.insertText}
-											</span>
-										</p>
-									</div>
+									{isScrollLocked ? "🔒" : "🔓"}
 								</button>
-							))}
+								<button
+									type="button"
+									onClick={handlePreviousChange}
+									disabled={selectedChangeIndex === 0}
+									className="p-1 px-2 border border-gray-400 rounded hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+									title="Previous change"
+								>
+									←
+								</button>
+								<button
+									type="button"
+									onClick={handleNextChange}
+									disabled={selectedChangeIndex === operationsMap.size - 1}
+									className="p-1 px-2 border border-gray-400 rounded hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+									title="Next change"
+								>
+									→
+								</button>
+							</div>
+						</div>
+						<div>
+							{/* display individual operations grouped by page */}
+							{(() => {
+								// Group changes by page
+								const changesByPage = new Map<
+									number,
+									Array<[string, ChangeOperation, number]>
+								>();
+								Array.from(operationsMap).forEach(([key, value], index) => {
+									const pageIndex = value.pageIndex ?? 0;
+									if (!changesByPage.has(pageIndex)) {
+										changesByPage.set(pageIndex, []);
+									}
+									const pageChanges = changesByPage.get(pageIndex);
+									if (pageChanges) {
+										pageChanges.push([key, value, index]);
+									}
+								});
+
+								// Sort pages
+								const sortedPages = Array.from(changesByPage.keys()).sort(
+									(a, b) => a - b,
+								);
+
+								return sortedPages.map((pageIndex) => {
+									const pageChanges = changesByPage.get(pageIndex);
+									if (!pageChanges) return null;
+
+									return (
+										<div key={`page-${pageIndex}`}>
+											<div className="bg-gray-100 p-2 text-sm font-medium text-gray-700 sticky top-0">
+												Page {pageIndex + 1}
+											</div>
+											{pageChanges.map(([key, value, index]) => (
+												<button
+													key={key}
+													type="button"
+													className={`p-2 border rounded mx-auto mb-2 w-11/12 cursor-pointer transition-all text-left block ${
+														selectedChangeIndex === index
+															? "border-blue-600 bg-blue-50 border-2 shadow-md"
+															: "border-gray-300 hover:bg-gray-50 hover:border-gray-400"
+													}`}
+													onClick={() => handleChangeClick(value, index)}
+												>
+													<div className="flex justify-between p-1 pl-0">
+														<div className="text-gray-400 text-xs">
+															{value.insert && value.del
+																? "replaced"
+																: value.insert
+																	? "inserted"
+																	: "deleted"}
+														</div>
+														{plusMinusDisplayText(value)}
+													</div>
+													<div>
+														{value.deleteText && (
+															<p className="text-xs mb-0.5">
+																<span className="bg-delete-highlight">
+																	{value.deleteText}
+																</span>
+															</p>
+														)}
+														{value.insertText && (
+															<p className="text-xs">
+																<span className="bg-insert-highlight">
+																	{value.insertText}
+																</span>
+															</p>
+														)}
+													</div>
+												</button>
+											))}
+										</div>
+									);
+								});
+							})()}
 						</div>
 					</div>
 				</div>
