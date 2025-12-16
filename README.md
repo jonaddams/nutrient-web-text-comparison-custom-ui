@@ -55,11 +55,17 @@ For detailed technical information about the implementation, including the docum
    - `text-comparison-b.pdf` (modified document)
 
 2. Configure environment variables:
-   - Create a `.env.local` file in the root directory
-   - Add your license key:
+   - Copy `.env.example` to `.env.local`
+   - Update the values in `.env.local`:
      ```
-     NEXT_PUBLIC_NUTRIENT_LICENSE_KEY="your-license-key"
+     # Nutrient SDK Configuration
+     NEXT_PUBLIC_NUTRIENT_VIEWER_VERSION=1.10.0
+     NEXT_PUBLIC_NUTRIENT_SDK_VERSION=2024.8.1
+
+     # Your Nutrient License Key
+     NEXT_PUBLIC_NUTRIENT_LICENSE_KEY=your_license_key_here
      ```
+   - To upgrade SDK versions, simply update the version numbers in `.env.local`
 
 3. Install dependencies:
 
@@ -81,7 +87,19 @@ yarn dev
 
 ## Configuration
 
-Key configuration options in `page.jsx`:
+### Environment Variables
+
+All SDK version configuration is managed through environment variables in `.env.local`:
+
+- `NEXT_PUBLIC_NUTRIENT_VIEWER_VERSION`: Version of the Nutrient Viewer SDK (loaded in layout.tsx)
+- `NEXT_PUBLIC_NUTRIENT_SDK_VERSION`: Version of the PSPDFKit SDK (loaded in page.tsx)
+- `NEXT_PUBLIC_NUTRIENT_LICENSE_KEY`: Your Nutrient license key
+
+To upgrade SDK versions, simply update these values in your `.env.local` file. No code changes required.
+
+### Code Configuration
+
+Key configuration options in `page.tsx`:
 
 - `numberOfContextWords`: Controls the context size for text comparison (default: 100)
 - `deleteHighlightColor`: Color for deleted text highlights
