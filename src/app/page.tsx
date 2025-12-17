@@ -34,7 +34,6 @@ export default function Page() {
 	const [isScrollLocked, setIsScrollLocked] = useState<boolean>(true); // Track whether scrolling is synchronized
 	const isScrollLockedRef = useRef<boolean>(true); // Ref to track scroll lock state for event handlers
 	const isSyncingRef = useRef<boolean>(false); // Ref to prevent sync loop
-	const lastSyncTimeRef = useRef<number>(0); // Ref to track last sync time for throttling
 	const originalContainerRef = useRef<HTMLDivElement>(null); // Ref for the original document viewer container
 	const changedContainerRef = useRef<HTMLDivElement>(null); // Ref for the changed document viewer container
 	const operationsRef = useRef<Map<string, ChangeOperation>>(new Map()); // Ref for tracking changes across all pages
@@ -210,9 +209,20 @@ export default function Page() {
 			// Synchronize changed viewer -> original viewer
 			const changedScrollElement =
 				changedInstance.contentDocument.querySelector(".PSPDFKit-Scroll");
-			changedScrollElement?.addEventListener("scroll", syncChangedToOriginal, {
-				passive: true,
-			});
+			let changedScrollFrame: number | null = null;
+
+			changedScrollElement?.addEventListener(
+				"scroll",
+				() => {
+					if (changedScrollFrame) return; // Already scheduled
+					changedScrollFrame = requestAnimationFrame(() => {
+						syncChangedToOriginal();
+						changedScrollFrame = null;
+					});
+				},
+				{ passive: true },
+			);
+
 			changedInstance.addEventListener(
 				"viewState.currentPageIndex.change",
 				syncChangedToOriginal,
@@ -225,9 +235,20 @@ export default function Page() {
 			// Synchronize original viewer -> changed viewer
 			const originalScrollElement =
 				originalInstance.contentDocument.querySelector(".PSPDFKit-Scroll");
-			originalScrollElement?.addEventListener("scroll", syncOriginalToChanged, {
-				passive: true,
-			});
+			let originalScrollFrame: number | null = null;
+
+			originalScrollElement?.addEventListener(
+				"scroll",
+				() => {
+					if (originalScrollFrame) return; // Already scheduled
+					originalScrollFrame = requestAnimationFrame(() => {
+						syncOriginalToChanged();
+						originalScrollFrame = null;
+					});
+				},
+				{ passive: true },
+			);
+
 			originalInstance.addEventListener(
 				"viewState.currentPageIndex.change",
 				syncOriginalToChanged,
@@ -242,49 +263,38 @@ export default function Page() {
 				// Only sync if scroll is locked and not already syncing
 				if (!isScrollLockedRef.current || isSyncingRef.current) return;
 
-				// Throttle: only sync every 16ms (roughly 60fps)
-				const now = performance.now();
-				if (now - lastSyncTimeRef.current < 16) return;
-				lastSyncTimeRef.current = now;
-
 				isSyncingRef.current = true;
 
 				try {
-					// Get the current view state from the changed viewer
-					const changedScrollElement =
-						changedInstance.contentDocument.querySelector(
+					const sourceViewState = changedInstance.viewState;
+					const targetViewState = originalInstance.viewState;
+					const sourcePage = sourceViewState.currentPageIndex;
+					const targetPage = targetViewState.currentPageIndex;
+
+					// Sync zoom if different
+					if (targetViewState.zoom !== sourceViewState.zoom) {
+						originalInstance.setViewState(
+							targetViewState.set("zoom", sourceViewState.zoom),
+						);
+					}
+
+					// Sync page if different
+					if (targetPage !== sourcePage) {
+						originalInstance.setViewState(
+							targetViewState.set("currentPageIndex", sourcePage),
+						);
+					} else {
+						// Same page: sync scroll position
+						const sourceScroll = changedInstance.contentDocument.querySelector(
+							".PSPDFKit-Scroll",
+						) as HTMLElement | null;
+						const targetScroll = originalInstance.contentDocument.querySelector(
 							".PSPDFKit-Scroll",
 						) as HTMLElement | null;
 
-					const customViewState = {
-						pageNumber: changedInstance.viewState.currentPageIndex,
-						zoomLevel: changedInstance.viewState.zoom,
-						scrollLeft: changedScrollElement?.scrollLeft || 0,
-						scrollTop: changedScrollElement?.scrollTop || 0,
-					};
-
-					const originalPageIndex = originalInstance.viewState.currentPageIndex;
-
-					// Always sync zoom level
-					const viewState = originalInstance.viewState;
-					originalInstance.setViewState(
-						viewState.set("zoom", customViewState.zoomLevel),
-					);
-
-					// If pages differ, only update page number (let SDK handle layout)
-					if (originalPageIndex !== customViewState.pageNumber) {
-						originalInstance.setViewState(
-							viewState.set("currentPageIndex", customViewState.pageNumber),
-						);
-					} else {
-						// Same page: sync scroll positions directly for smooth scrolling
-						const originalScrollElement =
-							originalInstance.contentDocument.querySelector(
-								".PSPDFKit-Scroll",
-							) as HTMLElement | null;
-						if (originalScrollElement) {
-							originalScrollElement.scrollLeft = customViewState.scrollLeft;
-							originalScrollElement.scrollTop = customViewState.scrollTop;
+						if (sourceScroll && targetScroll) {
+							targetScroll.scrollTop = sourceScroll.scrollTop;
+							targetScroll.scrollLeft = sourceScroll.scrollLeft;
 						}
 					}
 				} finally {
@@ -297,49 +307,38 @@ export default function Page() {
 				// Only sync if scroll is locked and not already syncing
 				if (!isScrollLockedRef.current || isSyncingRef.current) return;
 
-				// Throttle: only sync every 16ms (roughly 60fps)
-				const now = performance.now();
-				if (now - lastSyncTimeRef.current < 16) return;
-				lastSyncTimeRef.current = now;
-
 				isSyncingRef.current = true;
 
 				try {
-					// Get the current view state from the original viewer
-					const originalScrollElement =
-						originalInstance.contentDocument.querySelector(
+					const sourceViewState = originalInstance.viewState;
+					const targetViewState = changedInstance.viewState;
+					const sourcePage = sourceViewState.currentPageIndex;
+					const targetPage = targetViewState.currentPageIndex;
+
+					// Sync zoom if different
+					if (targetViewState.zoom !== sourceViewState.zoom) {
+						changedInstance.setViewState(
+							targetViewState.set("zoom", sourceViewState.zoom),
+						);
+					}
+
+					// Sync page if different
+					if (targetPage !== sourcePage) {
+						changedInstance.setViewState(
+							targetViewState.set("currentPageIndex", sourcePage),
+						);
+					} else {
+						// Same page: sync scroll position
+						const sourceScroll = originalInstance.contentDocument.querySelector(
+							".PSPDFKit-Scroll",
+						) as HTMLElement | null;
+						const targetScroll = changedInstance.contentDocument.querySelector(
 							".PSPDFKit-Scroll",
 						) as HTMLElement | null;
 
-					const customViewState = {
-						pageNumber: originalInstance.viewState.currentPageIndex,
-						zoomLevel: originalInstance.viewState.zoom,
-						scrollLeft: originalScrollElement?.scrollLeft || 0,
-						scrollTop: originalScrollElement?.scrollTop || 0,
-					};
-
-					const changedPageIndex = changedInstance.viewState.currentPageIndex;
-
-					// Always sync zoom level
-					const viewState = changedInstance.viewState;
-					changedInstance.setViewState(
-						viewState.set("zoom", customViewState.zoomLevel),
-					);
-
-					// If pages differ, only update page number (let SDK handle layout)
-					if (changedPageIndex !== customViewState.pageNumber) {
-						changedInstance.setViewState(
-							viewState.set("currentPageIndex", customViewState.pageNumber),
-						);
-					} else {
-						// Same page: sync scroll positions directly for smooth scrolling
-						const changedScrollElement =
-							changedInstance.contentDocument.querySelector(
-								".PSPDFKit-Scroll",
-							) as HTMLElement | null;
-						if (changedScrollElement) {
-							changedScrollElement.scrollLeft = customViewState.scrollLeft;
-							changedScrollElement.scrollTop = customViewState.scrollTop;
+						if (sourceScroll && targetScroll) {
+							targetScroll.scrollTop = sourceScroll.scrollTop;
+							targetScroll.scrollLeft = sourceScroll.scrollLeft;
 						}
 					}
 				} finally {
